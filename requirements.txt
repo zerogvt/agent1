@@ -1,0 +1,5 @@
+# Steps 1-4 use only the Python standard library.
+# Step 5 (telemetry): OpenTelemetry API + SDK, and the OTLP/HTTP exporter for Dynatrace.
+opentelemetry-api>=1.45
+opentelemetry-sdk>=1.45
+opentelemetry-exporter-otlp-proto-http>=1.45
