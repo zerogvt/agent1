@@ -28,7 +28,12 @@ import telemetry
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 DEBUG = os.environ.get("DEBUG")
-MAX_STEPS = 5
+MAX_STEPS = 5  # tool rounds per turn
+# One reply can hold many tool calls (a small model can repeat a block of calls
+# dozens of times in one reply), so rounds alone don't bound the work.
+MAX_TOOL_CALLS = 10  # tool calls per turn
+MAX_REPLY_TOKENS = 512  # per model call; Ollama's default is "until the context is full"
+MODEL_TIMEOUT_S = 120  # per model call; without it a runaway reply hangs the agent
 AGENT_NAME = "agent1"
 
 TOOLS = [
@@ -94,6 +99,7 @@ def chat(messages):
         "tools": TOOLS,
         "messages": messages,
         "stream": False,  # one complete JSON answer instead of a token-by-token stream
+        "options": {"num_predict": MAX_REPLY_TOKENS},
     }
     body = json.dumps(payload).encode()
 
@@ -106,7 +112,7 @@ def chat(messages):
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=MODEL_TIMEOUT_S) as resp:
         return json.load(resp)
 
 
@@ -131,14 +137,24 @@ def run_tool(call):
 
 
 def agent_loop(messages):
-    """The step 4 loop. Returns how the turn ended: answered | gave_up | outage."""
+    """The step 4 loop. Returns how the turn ended:
+    answered | gave_up | outage | timeout | truncated."""
     tool_rounds = 0
+    tool_calls = 0
     while True:
         try:
             reply = chat(messages)
         except urllib.error.URLError as e:
             print(f"!! could not reach {OLLAMA_URL}: {e.reason}")
             return "outage"
+        except TimeoutError:
+            # Raised as-is (not wrapped in URLError) when Ollama is reachable but slow.
+            print(f"!! model did not answer within {MODEL_TIMEOUT_S}s")
+            return "timeout"
+        if reply.get("done_reason") == "length":
+            # Cut off by num_predict: possibly mid tool call, so it is not an answer.
+            print(f"!! reply cut off at {MAX_REPLY_TOKENS} tokens")
+            return "truncated"
         messages.append(reply["message"])
 
         tc = reply["message"].get("tool_calls")
@@ -149,7 +165,11 @@ def agent_loop(messages):
         if tool_rounds == MAX_STEPS:
             print(f"!! gave up after {MAX_STEPS} rounds")
             return "gave_up"
+        if tool_calls + len(tc) > MAX_TOOL_CALLS:
+            print(f"!! gave up: {tool_calls + len(tc)} tool calls requested, limit is {MAX_TOOL_CALLS}")
+            return "gave_up"
         tool_rounds += 1
+        tool_calls += len(tc)
 
         for call in tc:
             messages.append(
@@ -159,7 +179,8 @@ def agent_loop(messages):
 
 @instr.agent_turn(AGENT_NAME)  # feature: telemetry
 def run_turn(messages, question):
-    """One user turn. On failure the turn is rolled back (tools that ran are NOT undone)."""
+    """One user turn. On any outcome but "answered" the turn is rolled back
+    (tools that already ran are NOT undone)."""
     turn_start = len(messages)
     messages.append({"role": "user", "content": question})
     outcome = agent_loop(messages)

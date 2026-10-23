@@ -47,6 +47,7 @@ TREE_ATTRS = {
     "gen_ai.usage.input_tokens": "in",
     "gen_ai.usage.output_tokens": "out",
     "gen_ai.response.finish_reasons": "finish",
+    "agent1.reply.tool_calls": "calls",
     "agent1.turn.outcome": "outcome",
     "agent1.turn.model_calls": "model_calls",
     "agent1.turn.tool_calls": "tool_calls",

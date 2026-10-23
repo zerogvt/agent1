@@ -94,7 +94,7 @@ def _mark_error(span, error_type, exc=None):
 
 
 def agent_turn(agent_name):
-    """Root span for one user turn. The function returns the outcome: answered | gave_up | outage."""
+    """Root span for one user turn. The function returns the outcome; anything but "answered" is an error."""
 
     def decorate(fn):
         @functools.wraps(fn)
@@ -186,6 +186,9 @@ def model_call(provider, model, url):
                             "prompt_eval_cached_count", 0
                         ),
                         "gen_ai.response.finish_reasons": [reply.get("done_reason", "")],
+                        # How many tool calls this one reply asked for: a burst here is the
+                        # repetition-loop signature (no semconv attribute for it).
+                        "agent1.reply.tool_calls": len(reply["message"].get("tool_calls") or []),
                     }
                 )
                 # Ollama's timing breakdown (ns → s): loading the model vs reading the prompt vs generating.
