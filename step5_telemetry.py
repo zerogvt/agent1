@@ -4,7 +4,7 @@ Same agent as step 4. Telemetry is attached with three decorators (see instrumen
 so the agent code stays readable; every user turn becomes a trace:
 
   invoke_agent agent1      one user turn: outcome, model calls, tool calls, tokens
-    chat qwen2.5:3b        one model call: tokens, finish reason, Ollama timings
+    chat qwen2.5:3b        one model call: tokens, finish reason
     execute_tool add       one tool call: arguments, result, error
     chat qwen2.5:3b
 
@@ -12,12 +12,18 @@ Run:  .venv/bin/python step5_telemetry.py
       DEBUG=1 .venv/bin/python step5_telemetry.py     # also dump raw request/response JSON
       OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false ...   # keep prompts/results off spans
 See telemetry.py for exporting to Dynatrace.
+
+Unlike steps 1-4 (Ollama's own /api/chat), this step speaks the OpenAI-compatible
+chat completions API, so the same code runs against local Ollama or a hosted service:
+
+  LLM_BASE_URL=https://api.groq.com/openai/v1 LLM_API_KEY=... LLM_MODEL=... .venv/bin/python step5_telemetry.py
 """
 
 import datetime
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # feature: telemetry — local modules: telemetry.py (where data goes),
@@ -25,8 +31,15 @@ import urllib.request
 import instrumentation as instr
 import telemetry
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+# Defaults to local Ollama, which serves the OpenAI-compatible API under /v1 and ignores the key.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+MODEL = os.environ.get("LLM_MODEL", "qwen2.5:3b")
+_host = urllib.parse.urlparse(LLM_BASE_URL).hostname
+# gen_ai.provider.name on spans and metrics; guessed from the URL unless set.
+PROVIDER = os.environ.get("LLM_PROVIDER") or (
+    "ollama" if _host in ("localhost", "127.0.0.1") else _host
+)
 DEBUG = os.environ.get("DEBUG")
 MAX_STEPS = 5  # tool rounds per turn
 # One reply can hold many tool calls (a small model can repeat a block of calls
@@ -91,15 +104,15 @@ class UnknownToolError(Exception):
     pass
 
 
-@instr.model_call("ollama", MODEL, OLLAMA_URL)  # feature: telemetry
+@instr.model_call(PROVIDER, MODEL, LLM_BASE_URL)  # feature: telemetry
 def chat(messages):
-    """POST the conversation to Ollama's /api/chat and return the parsed JSON reply."""
+    """POST the conversation to /chat/completions and return the parsed JSON reply."""
     payload = {
         "model": MODEL,
         "tools": TOOLS,
         "messages": messages,
         "stream": False,  # one complete JSON answer instead of a token-by-token stream
-        "options": {"num_predict": MAX_REPLY_TOKENS},
+        "max_tokens": MAX_REPLY_TOKENS,
     }
     body = json.dumps(payload).encode()
 
@@ -107,22 +120,29 @@ def chat(messages):
         print("=== REQUEST ===")
         print(json.dumps(payload, indent=2))
 
-    req = urllib.request.Request(
-        f"{OLLAMA_URL}/api/chat",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
+    # Some hosted APIs sit behind Cloudflare, which refuses urllib's default
+    # "Python-urllib/3.x" User-Agent with a 403 (error code 1010).
+    headers = {"Content-Type": "application/json", "User-Agent": "agent1/0.1"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    req = urllib.request.Request(f"{LLM_BASE_URL}/chat/completions", data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=MODEL_TIMEOUT_S) as resp:
-        return json.load(resp)
+        reply = json.load(resp)
+
+    if DEBUG:
+        print("=== RESPONSE ===")
+        print(json.dumps(reply, indent=2))
+    return reply
 
 
 @instr.tool_execution  # feature: telemetry
 def execute_tool(name, args, call_id):
-    """Run one tool. Raises on failure (unknown tool, bad arguments, tool error)."""
+    """Run one tool. args is the JSON string the model sent.
+    Raises on failure (unknown tool, bad arguments, tool error)."""
     fn = TOOLS_FUNC.get(name)
     if fn is None:
         raise UnknownToolError(f"unknown tool: {name}")
-    return fn(**args)
+    return fn(**json.loads(args or "{}"))
 
 
 def run_tool(call):
@@ -138,28 +158,36 @@ def run_tool(call):
 
 def agent_loop(messages):
     """The step 4 loop. Returns how the turn ended:
-    answered | gave_up | outage | timeout | truncated."""
+    answered | gave_up | outage | timeout | rate_limited | api_error | truncated."""
     tool_rounds = 0
     tool_calls = 0
     while True:
         try:
             reply = chat(messages)
+        except urllib.error.HTTPError as e:
+            # Reachable, but the request was refused. HTTPError is a URLError, so it goes first.
+            print(f"!! {LLM_BASE_URL} answered {e.code}: {e.read().decode(errors='replace')[:500]}")
+            return "rate_limited" if e.code == 429 else "api_error"
         except urllib.error.URLError as e:
-            print(f"!! could not reach {OLLAMA_URL}: {e.reason}")
+            print(f"!! could not reach {LLM_BASE_URL}: {e.reason}")
             return "outage"
         except TimeoutError:
-            # Raised as-is (not wrapped in URLError) when Ollama is reachable but slow.
+            # Raised as-is (not wrapped in URLError) when the server is reachable but slow.
             print(f"!! model did not answer within {MODEL_TIMEOUT_S}s")
             return "timeout"
-        if reply.get("done_reason") == "length":
-            # Cut off by num_predict: possibly mid tool call, so it is not an answer.
+        choice = reply["choices"][0]
+        if choice.get("finish_reason") == "length":
+            # Cut off by max_tokens: possibly mid tool call, so it is not an answer.
             print(f"!! reply cut off at {MAX_REPLY_TOKENS} tokens")
             return "truncated"
-        messages.append(reply["message"])
+        message = choice["message"]
+        # Re-send only the standard fields: extras such as a reasoning model's
+        # "reasoning" text can be refused by strict servers when sent back.
+        messages.append({k: message[k] for k in ("role", "content", "tool_calls") if k in message})
 
-        tc = reply["message"].get("tool_calls")
+        tc = message.get("tool_calls")
         if not tc:
-            print(reply["message"]["content"])
+            print(message.get("content"))
             return "answered"
 
         if tool_rounds == MAX_STEPS:
@@ -172,9 +200,7 @@ def agent_loop(messages):
         tool_calls += len(tc)
 
         for call in tc:
-            messages.append(
-                {"role": "tool", "tool_name": call.get("function").get("name"), "content": run_tool(call)}
-            )
+            messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": run_tool(call)})
 
 
 @instr.agent_turn(AGENT_NAME)  # feature: telemetry

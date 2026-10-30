@@ -4,16 +4,15 @@ feature: telemetry — this module keeps instrumentation out of the agent code. 
 marks three kinds of function; everything about spans, attributes and metrics lives here:
 
   @agent_turn(name)            fn(messages, question) -> outcome   → "invoke_agent <name>" span
-  @model_call(provider, model, url)  fn(messages) -> Ollama reply → "chat <model>" span
+  @model_call(provider, model, url)  fn(messages) -> chat completion → "chat <model>" span
   @tool_execution              fn(name, args, call_id) -> result   → "execute_tool <name>" span
 
 A decorator only sees a function's inputs, return value and exceptions, so that is the
 contract: e.g. a failing tool must *raise* inside the decorated function, or its span
 stays green.
 
-Names follow the OpenTelemetry GenAI semantic conventions (gen_ai.*); agent- and
-Ollama-specific extras live under agent1.* / ollama.*. Where telemetry is *sent* is
-decided in telemetry.py.
+Names follow the OpenTelemetry GenAI semantic conventions (gen_ai.*); agent-specific
+extras live under agent1.*. Where telemetry is *sent* is decided in telemetry.py.
 """
 
 import contextvars
@@ -21,6 +20,7 @@ import functools
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
 import uuid
 
@@ -143,8 +143,9 @@ def agent_turn(agent_name):
 
 
 def model_call(provider, model, url):
-    """CLIENT span for one model call. Reads the reply in Ollama's shape."""
+    """CLIENT span for one model call. Reads the reply in the OpenAI chat completions shape."""
     server = urllib.parse.urlparse(url)
+    port = server.port or (443 if server.scheme == "https" else 80)
 
     def decorate(fn):
         @functools.wraps(fn)
@@ -157,45 +158,46 @@ def model_call(provider, model, url):
             with tracer.start_as_current_span(f"chat {model}", kind=SpanKind.CLIENT) as span:
                 span.set_attributes(metric_attrs)
                 span.set_attribute("server.address", server.hostname)
-                span.set_attribute("server.port", server.port or 80)
+                span.set_attribute("server.port", port)
                 if CAPTURE_CONTENT:
-                    # Ollama's message format, not the semconv parts structure — close enough to read.
+                    # OpenAI's message format, not the semconv parts structure — close enough to read.
                     span.set_attribute("gen_ai.input.messages", json.dumps(messages))
 
                 started = time.monotonic()
                 try:
                     reply = fn(messages)
                 except Exception as e:
-                    _mark_error(span, type(e).__name__, e)
+                    # An HTTP error is recorded by its status code (e.g. "429"), as semconv suggests.
+                    error_type = str(e.code) if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+                    _mark_error(span, error_type, e)
                     op_duration.record(
-                        time.monotonic() - started,
-                        {**metric_attrs, "error.type": type(e).__name__},
+                        time.monotonic() - started, {**metric_attrs, "error.type": error_type}
                     )
                     raise
                 op_duration.record(time.monotonic() - started, metric_attrs)
 
-                input_tokens = reply.get("prompt_eval_count", 0)
-                output_tokens = reply.get("eval_count", 0)
+                choice = reply["choices"][0]
+                usage = reply.get("usage") or {}
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
                 span.set_attributes(
                     {
+                        "gen_ai.response.id": reply.get("id", ""),
                         "gen_ai.response.model": reply.get("model", model),
                         "gen_ai.usage.input_tokens": input_tokens,
                         "gen_ai.usage.output_tokens": output_tokens,
-                        # Ollama reuses its cache for an unchanged prefix of the conversation.
-                        "gen_ai.usage.cache_read.input_tokens": reply.get(
-                            "prompt_eval_cached_count", 0
-                        ),
-                        "gen_ai.response.finish_reasons": [reply.get("done_reason", "")],
+                        # Prompt prefix served from the provider's cache; not every provider reports it.
+                        "gen_ai.usage.cache_read.input_tokens": (
+                            usage.get("prompt_tokens_details") or {}
+                        ).get("cached_tokens", 0),
+                        "gen_ai.response.finish_reasons": [choice.get("finish_reason") or ""],
                         # How many tool calls this one reply asked for: a burst here is the
                         # repetition-loop signature (no semconv attribute for it).
-                        "agent1.reply.tool_calls": len(reply["message"].get("tool_calls") or []),
+                        "agent1.reply.tool_calls": len(choice["message"].get("tool_calls") or []),
                     }
                 )
-                # Ollama's timing breakdown (ns → s): loading the model vs reading the prompt vs generating.
-                for field in ("load_duration", "prompt_eval_duration", "eval_duration"):
-                    span.set_attribute(f"ollama.{field}_s", reply.get(field, 0) / 1e9)
                 if CAPTURE_CONTENT:
-                    span.set_attribute("gen_ai.output.messages", json.dumps([reply["message"]]))
+                    span.set_attribute("gen_ai.output.messages", json.dumps([choice["message"]]))
 
                 token_usage.record(input_tokens, {**metric_attrs, "gen_ai.token.type": "input"})
                 token_usage.record(output_tokens, {**metric_attrs, "gen_ai.token.type": "output"})
@@ -222,7 +224,10 @@ def tool_execution(fn):
                 }
             )
             if CAPTURE_CONTENT:
-                span.set_attribute("gen_ai.tool.call.arguments", json.dumps(args))
+                # Already a JSON string in the OpenAI format.
+                span.set_attribute(
+                    "gen_ai.tool.call.arguments", args if isinstance(args, str) else json.dumps(args)
+                )
             _add_to_turn(tool_calls=1)
             try:
                 result = fn(name, args, call_id)

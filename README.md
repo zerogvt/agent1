@@ -1,6 +1,6 @@
 # agent1
 
-A very small AI agent built step by step to learn how agents work. It runs on a local model through Ollama and uses no agent framework. Each step is its own file, so you can diff one step against the next.
+A very small AI agent built step by step to learn how agents work. It runs on a local model through Ollama (step 5 can also use a free hosted model) and uses no agent framework. Each step is its own file, so you can diff one step against the next.
 
 | Step | File | What it adds |
 |---|---|---|
@@ -8,7 +8,7 @@ A very small AI agent built step by step to learn how agents work. It runs on a 
 | 2 | `step2_chat.py` | Chat with memory: the client re-sends the whole history on every turn |
 | 3 | `step3_tool.py` | The first tool: the model asks for a call, our code runs it |
 | 4 | `step4_agent.py` | The agent loop: several tool rounds, a step cap, errors returned as data, rollback |
-| 5 | `step5_telemetry.py` | Traces and metrics (OpenTelemetry, GenAI semantic conventions), plus limits that stop a runaway model |
+| 5 | `step5_telemetry.py` | Traces and metrics (OpenTelemetry, GenAI semantic conventions), plus limits that stop a runaway model. Uses the OpenAI-compatible API, so it runs on Ollama or a hosted model |
 
 Step 5 uses two helper modules: `instrumentation.py` (what is recorded) and `telemetry.py` (where it is sent).
 
@@ -55,9 +55,27 @@ Environment variables (all optional):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama server |
-| `OLLAMA_MODEL` | `qwen2.5:3b` | Model to use; it must support tools |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama server (steps 1–4) |
+| `OLLAMA_MODEL` | `qwen2.5:3b` | Model to use; it must support tools (steps 1–4) |
+| `LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible API (step 5). The default is local Ollama |
+| `LLM_API_KEY` | unset | API key, sent as `Authorization: Bearer` (step 5). Ollama doesn't need one |
+| `LLM_MODEL` | `qwen2.5:3b` | Model to use; it must support tools (step 5) |
+| `LLM_PROVIDER` | guessed from the URL | `gen_ai.provider.name` on spans and metrics (step 5): `ollama` for localhost, otherwise the host name |
 | `DEBUG` | unset | `DEBUG=1` dumps the raw request and response JSON (steps 2–5) |
+
+### Using a free hosted model (step 5)
+
+A small model on a laptop CPU is slow. Step 5 speaks the OpenAI-compatible chat completions API, so it also runs against hosted services with a free tier, such as [Groq](https://console.groq.com):
+
+```bash
+export LLM_BASE_URL=https://api.groq.com/openai/v1
+export LLM_API_KEY=<your key>          # create one at console.groq.com; don't commit it
+export LLM_MODEL=llama-3.3-70b-versatile   # any model from the provider's list that supports tool calling
+.venv/bin/python step5_telemetry.py
+```
+
+- **Your prompts and tool results leave your machine.** Don't let the agent read anything sensitive.
+- **Free tiers have rate limits.** A turn makes several model calls. A refused call ends the turn with outcome `rate_limited`.
 
 Some prompts to try with step 4 or 5:
 
@@ -86,7 +104,7 @@ Small models can get stuck in a loop. For example, `qwen2.5:3b` has been seen re
 |---|---|---|
 | `MAX_STEPS` | 5 | Tool rounds per turn (model replies that ask for tools) |
 | `MAX_TOOL_CALLS` | 10 | Tool calls per turn; one reply can contain many. Checked before any of the reply's calls run |
-| `MAX_REPLY_TOKENS` | 512 | Tokens per model reply, sent to Ollama as `options.num_predict`. Ollama's default is "until the context is full" |
+| `MAX_REPLY_TOKENS` | 512 | Tokens per model reply, sent as `max_tokens`. Ollama's default is "until the context is full" |
 | `MODEL_TIMEOUT_S` | 120 | Seconds to wait for each model call |
 
 Every turn ends with one of these outcomes, recorded as `agent1.turn.outcome` on the root span and in the `agent1.turns` metric:
@@ -95,8 +113,10 @@ Every turn ends with one of these outcomes, recorded as `agent1.turn.outcome` on
 |---|---|
 | `answered` | The model replied with text, which is **not** necessarily a correct answer (see below) |
 | `gave_up` | Hit `MAX_STEPS` or `MAX_TOOL_CALLS` |
-| `outage` | Ollama unreachable |
-| `timeout` | Ollama reachable, but no reply within `MODEL_TIMEOUT_S` |
+| `outage` | Model server unreachable |
+| `timeout` | Server reachable, but no reply within `MODEL_TIMEOUT_S` |
+| `rate_limited` | Server answered HTTP 429 (free tier limit reached) |
+| `api_error` | Server answered with another HTTP error, such as a bad key (401) or an unknown model. The response body is printed |
 | `truncated` | The reply hit `MAX_REPLY_TOKENS`. It may stop in the middle of a tool call, so it is not used as an answer |
 
 Every outcome other than `answered` rolls the turn back out of the history.
@@ -112,7 +132,7 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Api-Token%20<token>"   # %20, n
 ```
 
 - **Token scopes:** `openTelemetryTrace.ingest`, `metrics.ingest`.
-- **Allow-list the span attributes.** Dynatrace drops custom span attributes by default. Add `gen_ai.*`, `agent1.*` and `ollama.*` to the allow-list, or the traces arrive without them, even though the metrics look fine.
+- **Allow-list the span attributes.** Dynatrace drops custom span attributes by default. Add `gen_ai.*` and `agent1.*` to the allow-list, or the traces arrive without them, even though the metrics look fine.
 - **Exit with `quit` or Ctrl+D.** Spans are sent in batches and flushed on exit, so killing the process loses the last turns.
 - **Delta temporality.** Metrics are exported with delta temporality, which Dynatrace requires; this is already set up in `telemetry.py`.
 
@@ -126,8 +146,8 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Api-Token%20<token>"   # %20, n
 ## Known limitations
 
 - **Small CPU model.** `qwen2.5:3b` on a CPU is slow, often 5–20 s per call, and sometimes calls tools sloppily. That is useful for learning, but the results aren't reliable.
-- **Rollback only affects the history.** When a turn fails (cap reached or Ollama unreachable), it's removed from the history, but tools that already ran are not undone.
-- **No quality signal.** `answered` only means the model stopped asking for tools. With `(10+20)*30 + ((20+30)*(30+40))`, `qwen2.5:3b` guessed intermediate values it hadn't computed yet, then ended with "Let's perform step 2." and made no further call. That was recorded as `outcome=answered` with every span green. A bigger model (`OLLAMA_MODEL=qwen2.5:7b`) or a stricter system prompt helps. Detecting the failure needs a real quality check, such as an LLM judge or user feedback.
+- **Rollback only affects the history.** When a turn fails (cap reached or model server unreachable), it's removed from the history, but tools that already ran are not undone.
+- **No quality signal.** `answered` only means the model stopped asking for tools. With `(10+20)*30 + ((20+30)*(30+40))`, `qwen2.5:3b` guessed intermediate values it hadn't computed yet, then ended with "Let's perform step 2." and made no further call. That was recorded as `outcome=answered` with every span green. A bigger model (`LLM_MODEL=qwen2.5:7b`, or a hosted one) or a stricter system prompt helps. Detecting the failure needs a real quality check, such as an LLM judge or user feedback.
 - **Limits stop the agent; they don't make it work.** They turn a hang into a quick, visible failure. They don't make the model plan better.
 - **Timeouts are per call, not per turn.** A turn can still take up to `MAX_STEPS + 1` calls × `MODEL_TIMEOUT_S`.
-- **Message format.** `gen_ai.input.messages` / `gen_ai.output.messages` hold Ollama's message format, not the semantic-conventions "parts" structure.
+- **Message format.** `gen_ai.input.messages` / `gen_ai.output.messages` hold the OpenAI message format, not the semantic-conventions "parts" structure.
