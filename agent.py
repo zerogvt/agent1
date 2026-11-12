@@ -8,20 +8,23 @@ so the agent code stays readable; every user turn becomes a trace:
     execute_tool add       one tool call: arguments, result, error
     chat qwen2.5:3b
 
-Run:  .venv/bin/python step5_telemetry.py
-      DEBUG=1 .venv/bin/python step5_telemetry.py     # also dump raw request/response JSON
+Run:  .venv/bin/python agent.py
+      DEBUG=1 .venv/bin/python agent.py     # also dump raw request/response JSON
       OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false ...   # keep prompts/results off spans
 See telemetry.py for exporting to Dynatrace.
 
 Unlike steps 1-4 (Ollama's own /api/chat), this step speaks the OpenAI-compatible
 chat completions API, so the same code runs against local Ollama or a hosted service:
 
-  LLM_BASE_URL=https://api.groq.com/openai/v1 LLM_API_KEY=... LLM_MODEL=... .venv/bin/python step5_telemetry.py
+  LLM_BASE_URL=https://api.groq.com/openai/v1 LLM_API_KEY=... LLM_MODEL=... .venv/bin/python agent.py
 """
 
 import datetime
 import json
 import os
+# feature: prompt history — readline is Python's standard-library wrapper around GNU readline
+# (Linux/macOS). Importing it is enough to give input() arrow-key history and line editing.
+import readline
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -215,7 +218,28 @@ def run_turn(messages, question):
     return outcome
 
 
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".agent1_history")
+HISTORY_LENGTH = 1000
+
+
+def load_history():
+    """Arrow-up recalls prompts from earlier sessions too, not only this one."""
+    readline.set_history_length(HISTORY_LENGTH)
+    try:
+        readline.read_history_file(HISTORY_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def save_history():
+    try:
+        readline.write_history_file(HISTORY_FILE)
+    except OSError as e:
+        print(f"(could not save prompt history: {e})")
+
+
 def main():
+    load_history()
     messages = [
         {
             "role": "system",
@@ -231,11 +255,16 @@ def main():
                 print()
                 break
             if question.strip() in ["quit", "exit"]:
+                # readline has already recorded it; drop it so arrow-up starts at a real prompt.
+                last = readline.get_current_history_length()
+                if last and readline.get_history_item(last) == question:
+                    readline.remove_history_item(last - 1)  # get is 1-based, remove is 0-based
                 break
             if not question.strip():
                 continue
             run_turn(messages, question)
     finally:
+        save_history()
         telemetry.shutdown()  # feature: telemetry — flush, or the last turns never arrive
 
 

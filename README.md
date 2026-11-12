@@ -8,7 +8,7 @@ A very small AI agent built step by step to learn how agents work. It runs on a 
 | 2 | `step2_chat.py` | Chat with memory: the client re-sends the whole history on every turn |
 | 3 | `step3_tool.py` | The first tool: the model asks for a call, our code runs it |
 | 4 | `step4_agent.py` | The agent loop: several tool rounds, a step cap, errors returned as data, rollback |
-| 5 | `step5_telemetry.py` | Traces and metrics (OpenTelemetry, GenAI semantic conventions), plus limits that stop a runaway model. Uses the OpenAI-compatible API, so it runs on Ollama or a hosted model |
+| 5 | `agent.py` | Traces and metrics (OpenTelemetry, GenAI semantic conventions), plus limits that stop a runaway model. Uses the OpenAI-compatible API, so it runs on Ollama or a hosted model |
 
 Step 5 uses two helper modules: `instrumentation.py` (what is recorded) and `telemetry.py` (where it is sent).
 
@@ -47,8 +47,9 @@ Steps 1–4 use only the standard library. `requirements.txt` holds the OpenTele
 ```bash
 .venv/bin/python step1_raw_call.py "Why is the sky blue? One sentence."
 .venv/bin/python step2_chat.py        # steps 2-5 are interactive; type quit or press Ctrl+D to exit
+# agent.py keeps prompt history: press Up/Down to recall earlier prompts, also from past sessions (saved in .agent1_history)
 .venv/bin/python step4_agent.py
-.venv/bin/python step5_telemetry.py
+.venv/bin/python agent.py
 ```
 
 Environment variables (all optional):
@@ -71,7 +72,7 @@ A small model on a laptop CPU is slow. Step 5 speaks the OpenAI-compatible chat 
 export LLM_BASE_URL=https://api.groq.com/openai/v1
 export LLM_API_KEY=<your key>          # create one at console.groq.com; don't commit it
 export LLM_MODEL=llama-3.3-70b-versatile   # any model from the provider's list that supports tool calling
-.venv/bin/python step5_telemetry.py
+.venv/bin/python agent.py
 ```
 
 - **Your prompts and tool results leave your machine.** Don't let the agent read anything sensitive.
@@ -98,7 +99,7 @@ invoke_agent agent1  16.51s  in=548 out=62 outcome=answered model_calls=2 tool_c
 
 ### Limits and turn outcomes
 
-Small models can get stuck in a loop. For example, `qwen2.5:3b` has been seen repeating the same block of tool calls dozens of times in a single reply. Step 5 caps each turn with these constants at the top of `step5_telemetry.py`:
+Small models can get stuck in a loop. For example, `qwen2.5:3b` has been seen repeating the same block of tool calls dozens of times in a single reply. Step 5 caps each turn with these constants at the top of `agent.py`:
 
 | Constant | Value | What it limits |
 |---|---|---|
@@ -128,7 +129,7 @@ The limits are sized for the toy tools here. A real task may need higher values,
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=https://<env-id>.live.dynatrace.com/api/v2/otlp
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Api-Token%20<token>"   # %20, not a space
-.venv/bin/python step5_telemetry.py
+.venv/bin/python agent.py
 ```
 
 - **Token scopes:** `openTelemetryTrace.ingest`, `metrics.ingest`.
