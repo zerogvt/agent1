@@ -1,12 +1,15 @@
 """Step 5: the agent loop, with traces and metrics.
 
-Same agent as step 4. Telemetry is attached with three decorators (see instrumentation.py)
+Same agent as step 4. Telemetry is attached with decorators (see instrumentation.py)
 so the agent code stays readable; every user turn becomes a trace:
 
   invoke_agent agent1      one user turn: outcome, model calls, tool calls, tokens
     chat qwen2.5:3b        one model call: tokens, finish reason
-    execute_tool add       one tool call: arguments, result, error
+    execute_tool geocode   one tool call: arguments, result, error
+      GET                  the tool's outbound HTTP call: server, status (external tools only)
     chat qwen2.5:3b
+
+feature: external tools — geocode and get_weather call Open-Meteo over HTTP.
 
 Run:  .venv/bin/python agent.py
       DEBUG=1 .venv/bin/python agent.py     # also dump raw request/response JSON
@@ -25,6 +28,7 @@ import os
 # feature: prompt history — readline is Python's standard-library wrapper around GNU readline
 # (Linux/macOS). Importing it is enough to give input() arrow-key history and line editing.
 import readline
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,13 +48,26 @@ PROVIDER = os.environ.get("LLM_PROVIDER") or (
     "ollama" if _host in ("localhost", "127.0.0.1") else _host
 )
 DEBUG = os.environ.get("DEBUG")
-MAX_STEPS = 5  # tool rounds per turn
+MAX_STEPS = 15  # tool rounds per turn
 # One reply can hold many tool calls (a small model can repeat a block of calls
 # dozens of times in one reply), so rounds alone don't bound the work.
 MAX_TOOL_CALLS = 10  # tool calls per turn
-MAX_REPLY_TOKENS = 512  # per model call; Ollama's default is "until the context is full"
+# Per model call, sent as max_tokens. Ollama's default is "until the context is full".
+# Kept modest: Groq seems to count it against the tokens-per-minute limit up front.
+MAX_REPLY_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1000"))
 MODEL_TIMEOUT_S = 120  # per model call; without it a runaway reply hangs the agent
+# On HTTP 429, wait as long as the server's Retry-After header says, then try again.
+MAX_RATE_LIMIT_RETRIES = 3  # per model call
+MAX_RATE_LIMIT_WAIT_S = 30  # a longer wait (e.g. a daily limit) ends the turn instead
+DEFAULT_RATE_LIMIT_WAIT_S = 5  # when the 429 has no usable Retry-After header
 AGENT_NAME = "agent1"
+
+# feature: external tools — Open-Meteo (open-meteo.com): free weather and geocoding
+# APIs, no key, free for non-commercial use. Requests go out over plain urllib.
+GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+EXTERNAL_TIMEOUT_S = 10  # per HTTP call a tool makes; a slow service should not stall the turn
+MAX_FORECAST_DAYS = 7
 
 TOOLS = [
     {
@@ -85,6 +102,52 @@ TOOLS = [
             },
         },
     },
+    # feature: external tools — two tools backed by Open-Meteo. The model has to chain
+    # them: geocode a place name, then pass the coordinates to get_weather.
+    {
+        "type": "function",
+        "function": {
+            "name": "geocode",
+            "description": (
+                "Find places by name and return up to 5 matches, each with latitude, longitude, "
+                "country and region. Use it to get coordinates for get_weather. If several "
+                "places match, pick the likeliest or ask the user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Place name only, e.g. 'Thessaloniki'"},
+                    "country_code": {
+                        "type": "string",
+                        "description": "Optional ISO 3166-1 alpha-2 code to narrow the search, e.g. 'GR'",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": (
+                "Current weather and a daily forecast for a latitude/longitude. "
+                "Temperatures in °C, precipitation in mm, wind in km/h, times in local time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "latitude": {"type": "number"},
+                    "longitude": {"type": "number"},
+                    "days": {
+                        "type": "integer",
+                        "description": f"Forecast days including today, 1-{MAX_FORECAST_DAYS}. Default 3",
+                    },
+                },
+                "required": ["latitude", "longitude"],
+            },
+        },
+    },
 ]
 
 
@@ -100,7 +163,91 @@ def multiply(a, b):
     return a * b
 
 
-TOOLS_FUNC = {"get_time": get_time, "add": add, "multiply": multiply}
+# feature: external tools — everything from here to TOOLS_FUNC.
+
+# WMO weather interpretation codes, as listed in Open-Meteo's docs. Text reads better
+# than a bare number, for the model and in the trace.
+WEATHER_CODES = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "fog", 48: "depositing rime fog",
+    51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
+    56: "light freezing drizzle", 57: "dense freezing drizzle",
+    61: "slight rain", 63: "moderate rain", 65: "heavy rain",
+    66: "light freezing rain", 67: "heavy freezing rain",
+    71: "slight snow", 73: "moderate snow", 75: "heavy snow", 77: "snow grains",
+    80: "slight rain showers", 81: "moderate rain showers", 82: "violent rain showers",
+    85: "slight snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm with slight hail", 99: "thunderstorm with heavy hail",
+}
+
+
+@instr.http_call  # feature: telemetry
+def http_get_json(url):
+    """GET a URL and parse the JSON body. Raises on HTTP errors, network errors and timeouts,
+    so the tool fails and run_tool hands the error to the model as text."""
+    req = urllib.request.Request(url, headers={"User-Agent": "agent1/0.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=EXTERNAL_TIMEOUT_S) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as e:
+        # Open-Meteo explains a refused request in the body ({"reason": "Latitude must be ..."}).
+        # Put that in the message, so the model can fix its arguments instead of seeing "Bad Request".
+        try:
+            e.msg = json.loads(e.read()).get("reason") or e.msg
+        except ValueError:
+            pass
+        raise
+
+
+def geocode(name, country_code=None):
+    params = {"name": name, "count": 5, "language": "en", "format": "json"}
+    if country_code:
+        params["countryCode"] = country_code
+    _, body = http_get_json(f"{GEOCODING_URL}?{urllib.parse.urlencode(params)}")
+    matches = body.get("results") or []  # no "results" key at all when nothing matches
+    if not matches:
+        raise LookupError(f"no place found named {name!r}")
+    # Keep only what the model needs: fewer tokens and less to misread.
+    keep = ("name", "admin1", "country", "latitude", "longitude", "population")
+    return json.dumps([{k: m[k] for k in keep if k in m} for m in matches])
+
+
+def get_weather(latitude, longitude, days=3):
+    days = int(days)
+    if not 1 <= days <= MAX_FORECAST_DAYS:
+        raise ValueError(f"days must be 1-{MAX_FORECAST_DAYS}, got {days}")
+    params = {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "current": "temperature_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+        "precipitation_sum,precipitation_probability_max",
+        "timezone": "auto",  # the place's local time, so "today" means the place's today
+        "forecast_days": days,
+    }
+    _, body = http_get_json(f"{FORECAST_URL}?{urllib.parse.urlencode(params)}")
+
+    current = dict(body["current"])
+    current.pop("interval", None)  # the API's update interval in seconds; noise for the model
+    current["weather"] = WEATHER_CODES.get(current.pop("weather_code"), "unknown")
+    # The API returns daily data as columns (one list per variable). Small models
+    # read one record per day more reliably, so turn the columns into rows.
+    daily = body["daily"]
+    forecast = []
+    for i, date in enumerate(daily["time"]):
+        day = {key: values[i] for key, values in daily.items() if key != "time"}
+        day["weather"] = WEATHER_CODES.get(day.pop("weather_code"), "unknown")
+        forecast.append({"date": date, **day})
+    return json.dumps({"timezone": body.get("timezone"), "current": current, "daily": forecast})
+
+
+TOOLS_FUNC = {
+    "get_time": get_time,
+    "add": add,
+    "multiply": multiply,
+    "geocode": geocode,  # feature: external tools
+    "get_weather": get_weather,  # feature: external tools
+}
 
 
 class UnknownToolError(Exception):
@@ -138,6 +285,37 @@ def chat(messages):
     return reply
 
 
+def retry_after_seconds(e):
+    """Seconds the server asks us to wait, from the Retry-After header of a 429.
+    The header may also be an HTTP date; we don't handle that and use the default instead."""
+    try:
+        return max(0.0, float(e.headers.get("Retry-After")))
+    except (TypeError, ValueError):
+        return DEFAULT_RATE_LIMIT_WAIT_S
+
+
+@instr.rate_limit_wait  # feature: telemetry
+def wait_for_rate_limit(seconds):
+    time.sleep(seconds)
+
+
+def chat_with_retry(messages):
+    """chat(), but a 429 is retried after the wait the server asks for, within limits.
+    Every attempt is its own model call (and span); the last error is raised as is."""
+    for retry in range(1, MAX_RATE_LIMIT_RETRIES + 2):
+        try:
+            return chat(messages)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or retry > MAX_RATE_LIMIT_RETRIES:
+                raise
+            wait = retry_after_seconds(e)
+            if wait > MAX_RATE_LIMIT_WAIT_S:
+                print(f"!! rate limited; server asks for {wait:.0f}s, more than {MAX_RATE_LIMIT_WAIT_S}s")
+                raise
+            print(f"!! rate limited, waiting {wait:.1f}s (retry {retry}/{MAX_RATE_LIMIT_RETRIES})")
+            wait_for_rate_limit(wait)
+
+
 @instr.tool_execution  # feature: telemetry
 def execute_tool(name, args, call_id):
     """Run one tool. args is the JSON string the model sent.
@@ -166,7 +344,7 @@ def agent_loop(messages):
     tool_calls = 0
     while True:
         try:
-            reply = chat(messages)
+            reply = chat_with_retry(messages)
         except urllib.error.HTTPError as e:
             # Reachable, but the request was refused. HTTPError is a URLError, so it goes first.
             print(f"!! {LLM_BASE_URL} answered {e.code}: {e.read().decode(errors='replace')[:500]}")

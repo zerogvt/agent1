@@ -3,3 +3,10 @@
 opentelemetry-api>=1.45
 opentelemetry-sdk>=1.45
 opentelemetry-exporter-otlp-proto-http>=1.45
+# agent_oi.py (OpenInference variant): the openai SDK and OpenInference's instrumentor for it
+# (pulls in openinference-instrumentation and openinference-semantic-conventions).
+openai>=3.50
+openinference-instrumentation-openai>=0.1.73
+# agent_tl.py (OpenLLMetry variant): Traceloop's instrumentor for the openai SDK
+# (pulls in opentelemetry-semantic-conventions-ai). Not the full traceloop-sdk.
+opentelemetry-instrumentation-openai>=0.63

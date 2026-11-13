@@ -6,6 +6,8 @@ marks three kinds of function; everything about spans, attributes and metrics li
   @agent_turn(name)            fn(messages, question) -> outcome   → "invoke_agent <name>" span
   @model_call(provider, model, url)  fn(messages) -> chat completion → "chat <model>" span
   @tool_execution              fn(name, args, call_id) -> result   → "execute_tool <name>" span
+  @http_call                   fn(url) -> (status, body)           → "GET" span (a tool's outbound call)
+  @rate_limit_wait             fn(seconds) -> None                 → "rate_limit_wait" event on the turn span
 
 A decorator only sees a function's inputs, return value and exceptions, so that is the
 contract: e.g. a failing tool must *raise* inside the decorated function, or its span
@@ -99,7 +101,10 @@ def agent_turn(agent_name):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(messages, question):
-            stats = {"model_calls": 0, "tool_calls": 0, "input_tokens": 0, "output_tokens": 0}
+            stats = {
+                "model_calls": 0, "tool_calls": 0, "input_tokens": 0, "output_tokens": 0,
+                "rate_limit_retries": 0, "rate_limit_wait_s": 0.0,
+            }
             token = _turn_stats.set(stats)
             with tracer.start_as_current_span(f"invoke_agent {agent_name}") as span:
                 span.set_attributes(
@@ -130,6 +135,14 @@ def agent_turn(agent_name):
                         "gen_ai.usage.output_tokens": stats["output_tokens"],
                     }
                 )
+                if stats["rate_limit_retries"]:
+                    # Time the turn spent sleeping on 429s, not working.
+                    span.set_attributes(
+                        {
+                            "agent1.turn.rate_limit_retries": stats["rate_limit_retries"],
+                            "agent1.turn.rate_limit_wait_s": round(stats["rate_limit_wait_s"], 2),
+                        }
+                    )
                 # A turn can fail with every child span green — this is the agent-level error.
                 if outcome != "answered":
                     _mark_error(span, outcome)
@@ -207,6 +220,52 @@ def model_call(provider, model, url):
         return wrapper
 
     return decorate
+
+
+def http_call(fn):
+    """feature: external tools — CLIENT span for one outbound HTTP GET made by a tool.
+    fn(url) -> (status_code, parsed body); an HTTP error must raise (urllib does)."""
+
+    @functools.wraps(fn)
+    def wrapper(url):
+        server = urllib.parse.urlparse(url)
+        # HTTP semconv names client spans by method only; the host is an attribute.
+        with tracer.start_as_current_span("GET", kind=SpanKind.CLIENT) as span:
+            span.set_attributes(
+                {
+                    "http.request.method": "GET",
+                    "server.address": server.hostname,
+                    "server.port": server.port or (443 if server.scheme == "https" else 80),
+                    "url.full": url,
+                }
+            )
+            try:
+                status, body = fn(url)
+            except Exception as e:
+                if isinstance(e, urllib.error.HTTPError):
+                    span.set_attribute("http.response.status_code", e.code)
+                    error_type = str(e.code)
+                else:
+                    error_type = type(e).__name__
+                _mark_error(span, error_type, e)
+                raise
+            span.set_attribute("http.response.status_code", status)
+            return status, body
+
+    return wrapper
+
+
+def rate_limit_wait(fn):
+    """A wait before retrying a model call refused with 429. fn(seconds) does the waiting.
+    Recorded as an event on the current span (the turn's), and added to the turn's totals."""
+
+    @functools.wraps(fn)
+    def wrapper(seconds):
+        trace.get_current_span().add_event("rate_limit_wait", {"agent1.wait_s": seconds})
+        _add_to_turn(rate_limit_retries=1, rate_limit_wait_s=seconds)
+        return fn(seconds)
+
+    return wrapper
 
 
 def tool_execution(fn):
