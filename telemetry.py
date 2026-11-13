@@ -51,6 +51,9 @@ TREE_ATTRS = {
     "agent1.turn.outcome": "outcome",
     "agent1.turn.model_calls": "model_calls",
     "agent1.turn.tool_calls": "tool_calls",
+    "agent1.turn.rate_limit_retries": "retries",
+    "agent1.turn.rate_limit_wait_s": "waited_s",
+    "http.response.status_code": "status",  # feature: external tools
     "error.type": "error",
 }
 
@@ -100,9 +103,10 @@ class TreePrinter(SpanExporter):
         print("-------------")
 
 
-def setup():
-    """Install tracer + meter providers. Call once, before get_tracer()/get_meter()."""
-    resource = Resource.create({"service.name": SERVICE_NAME})
+def setup(service_name=SERVICE_NAME):
+    """Install tracer + meter providers. Call once, before get_tracer()/get_meter().
+    agent_tl.py passes its own service name; everything else is shared."""
+    resource = Resource.create({"service.name": service_name})
     otlp = bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
 
     tracer_provider = TracerProvider(resource=resource)
