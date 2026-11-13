@@ -187,15 +187,7 @@ The same agent, with the same tools, limits and `LLM_*` settings, traced with [O
 - **Service name `agent1-oi`**, agent name `agent1-oi`.
 - **Token scope:** `openTelemetryTrace.ingest` is enough. There are no metrics.
 
-What you lose compared with `agent.py`:
-
-| | `agent.py` | `agent_oi.py` |
-|---|---|---|
-| Metrics (token usage, duration, turns, tool calls) | yes | none: OpenInference is spans only |
-| Turn totals (tokens, model calls, tool calls, retries, waited) | on the turn span | not recorded (only `agent1.turn.outcome` is kept) |
-| `error.type` on a refused model call (e.g. `429`) | yes | no: ERROR status and an exception event only |
-| `gen_ai.provider.name` | `ollama`, or the host | `groq` for Groq; `openai` for Ollama (OpenInference only knows hosted APIs by host name) |
-| Tool calls per reply (`agent1.reply.tool_calls`) | yes | no |
+What it gains and loses compared with `agent.py` is under [Comparing the three](#comparing-the-three).
 
 One workaround in `agent_oi.py`: OpenInference fills `gen_ai.tool.call.arguments` from `tool.parameters`, which it defines as the tool's JSON *schema*. So the call's real arguments are set on `gen_ai.tool.call.arguments` directly.
 
@@ -217,6 +209,15 @@ The same agent again, traced with Traceloop's [OpenLLMetry](https://github.com/t
 
 ## Comparing the three
 
+In short:
+
+- **`agent.py` (hand-written)** records the most: every span type marked for Dynatrace's AI views, turn totals, agent-level metrics (turns by outcome, tool calls), and the provider named correctly. The cost is code you maintain yourself, and its messages are in OpenAI's format rather than the conventions' "parts" format.
+- **`agent_oi.py` (OpenInference)** describes the agent best of the two libraries: turn and tool spans are `invoke_agent` / `execute_tool`, tool arguments and results are in `gen_ai.tool.call.*`, and the conversation id is on every span. But it has **no metrics at all**, and every span carries a second attribute set (`llm.*`, `input.value`), so spans are much bigger.
+- **`agent_tl.py` (OpenLLMetry)** is best at the model call: `gen_ai.*` only, small spans, and **token-usage and duration metrics**. But turn and tool spans use Traceloop's own `traceloop.*` attributes, with no `gen_ai.operation.name` (likely not shown as agent or tool operations in Dynatrace; not yet checked), and there is no `gen_ai.conversation.id`.
+- **Both libraries** need the `openai` SDK instead of raw HTTP, report Ollama as provider `openai`, and record nothing about turns (totals, outcome); `agent1.turn.outcome` is added by hand in all three.
+
+Neither library wins outright. OpenLLMetry is better for metrics and span size, OpenInference for showing the agent and its tools. Dynatrace's current docs describe the OpenInference setup.
+
 | | `agent.py` (hand-written) | `agent_oi.py` (OpenInference) | `agent_tl.py` (OpenLLMetry) |
 |---|---|---|---|
 | Model call | `urllib` | `openai` SDK | `openai` SDK |
@@ -231,6 +232,7 @@ The same agent again, traced with Traceloop's [OpenLLMetry](https://github.com/t
 | Token usage / duration metrics | yes | none | yes |
 | Turn, tool and outcome metrics | yes | none | none |
 | Turn totals on the turn span | yes | no | no |
+| Tool calls per reply (`agent1.reply.tool_calls`) | yes | no | no |
 
 All three keep `agent1.turn.outcome` on the turn span, and the weather tools' `GET` spans come from `instrumentation.py` in all three.
 
